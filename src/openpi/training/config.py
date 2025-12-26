@@ -33,7 +33,6 @@ ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
 
-
 @dataclasses.dataclass(frozen=True)
 class AssetsConfig:
     """Determines the location of assets (e.g., norm stats) that will be used to set up the data pipeline.
@@ -198,6 +197,72 @@ class DataConfigFactory(abc.ABC):
         except FileNotFoundError:
             logging.info(f"Norm stats not found in {data_assets_dir}, skipping.")
         return None
+
+import numpy as np      
+import torch  
+import openpi.shared.normalize as normalize
+from openpi import transforms
+from PIL import Image
+def _convert_tensors_to_numpy(data):
+    # 1. 处理图像维度、类型与归一化恢复
+    if "image" in data:
+        new_images = {}
+        image_masks = {} # 准备存放掩码
+        for k, v in data["image"].items():
+            # 转换为 numpy
+            img = v.numpy() if isinstance(v, torch.Tensor) else np.array(v)
+            
+            # 处理 (C, H, W) -> (H, W, C)
+            if img.ndim == 3 and img.shape[0] == 3:
+                img = img.transpose(1, 2, 0)
+            
+            # 确保是 uint8 格式供 PIL/Resize 使用
+            if img.dtype != np.uint8:
+                img = (img * 255).clip(0, 255).astype(np.uint8)
+                
+            new_images[k] = img
+            # 【核心添加】为每个图像通道生成 True 掩码
+            image_masks[k] = True
+            
+        data["image"] = new_images
+        # 【核心修复】注入模型必需的 image_mask 字段
+        data["image_mask"] = image_masks
+        
+    return data
+
+@dataclasses.dataclass(frozen=True)
+class MKRobotDataConfig(DataConfigFactory):
+    #data_path: str = "/home/jr/PI/data/mkrobot_cube_dataset"
+    repo_id: str = "mkrobot_cube_dataset"
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        return DataConfig(
+            repo_id=self.repo_id,#"mkygogo/mkrobot_pi05_cube",
+            asset_id = self.repo_id,
+            #norm_stats=pathlib.Path("assets/pi05_mkrobot_lora/mkrobot_cube_dataset/norm_stats.json"),
+            norm_stats=normalize.load(pathlib.Path("assets/pi05_mkrobot_lora/mkrobot_cube_dataset")),
+            # 开启此项，自动从数据集读取你采集时定义的任务指令
+            prompt_from_task=True, 
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "image": {
+                                "top": "observation.images.top",
+                                "wrist": "observation.images.wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "task",
+                        }
+                    ),
+                    _convert_tensors_to_numpy,
+                ]
+            ),
+            # 使用标准的模型转换，将 448x448 的图像缩放至模型要求的 224x224
+            model_transforms=ModelTransformFactory()(model_config),
+            action_sequence_keys=("action",),
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -558,6 +623,34 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    TrainConfig(
+        name="pi05_mkrobot_lora",
+        # 明确指定使用 LoRA 变体，这在 JAX 逻辑中会触发模型结构的改变
+        model=pi0_config.Pi0Config(
+            pi05=True, 
+            action_dim=7, 
+            paligemma_variant="gemma_2b_lora", 
+            action_expert_variant="gemma_300m_lora"
+        ),
+        data=MKRobotDataConfig(),
+        # JAX 权重加载路径（gs:// 是 Google Storage 路径，如果本地有请改为本地路径）
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=1, 
+        num_train_steps=30_000,
+        # JAX 专属：冻结逻辑
+        # freeze_filter=pi0_config.Pi0Config(
+        #     paligemma_variant="gemma_2b_lora", 
+        #     action_expert_variant="gemma_300m_lora"
+        # ).get_freeze_filter(),
+        freeze_filter=lambda path, _: (
+            # 1. 将路径元组转为字符串
+            "llm" not in "".join(path).lower() or 
+            # 2. 确保只训练包含 lora 的层
+            "lora" not in "".join(path).lower()
+        ),
+        #remat=True,
+        ema_decay=None,
+    ),    
     #
     # Inference Aloha configs.
     #

@@ -70,16 +70,33 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         wandb.run.log_code(epath.Path(__file__).parent.parent)
 
 
-def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
-    """Loads and validates the weights. Returns a loaded subset of the weights."""
+# def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
+#     """Loads and validates the weights. Returns a loaded subset of the weights."""
+#     loaded_params = loader.load(params_shape)
+#     at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
+
+#     # Remove jax.ShapeDtypeStruct from the loaded params. This makes sure that only the loaded params are returned.
+#     return traverse_util.unflatten_dict(
+#         {k: v for k, v in traverse_util.flatten_dict(loaded_params).items() if not isinstance(v, jax.ShapeDtypeStruct)}
+#     )
+def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params, init_params: at.Params) -> at.Params:
+    """载入权重，确保 LoRA 层保留模型生成的真实初始值，而非 ShapeDtypeStruct"""
     loaded_params = loader.load(params_shape)
-    at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
+    
+    # 将模型生成的真实初始值（含 LoRA 层）扁平化
+    final_params_flat = traverse_util.flatten_dict(init_params)
+    loaded_flat = traverse_util.flatten_dict(loaded_params)
 
-    # Remove jax.ShapeDtypeStruct from the loaded params. This makes sure that only the loaded params are returned.
-    return traverse_util.unflatten_dict(
-        {k: v for k, v in traverse_util.flatten_dict(loaded_params).items() if not isinstance(v, jax.ShapeDtypeStruct)}
-    )
-
+    for k, v in loaded_flat.items():
+        if k in final_params_flat:
+            exp_val = final_params_flat[k]
+            # 只有当加载的 v 是真实数组且形状一致时才覆盖
+            if not isinstance(v, jax.ShapeDtypeStruct) and hasattr(v, "shape") and v.shape == exp_val.shape:
+                final_params_flat[k] = v
+            elif hasattr(v, "shape") and v.shape != exp_val.shape:
+                logging.warning(f"维度不匹配，跳过加载层: {k}, 使用随机初始化。")
+        
+    return traverse_util.unflatten_dict(final_params_flat)
 
 @at.typecheck
 def init_train_state(
@@ -119,7 +136,16 @@ def init_train_state(
     if resume:
         return train_state_shape, state_sharding
 
-    partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())
+    #partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())
+    model_for_init = config.model.create(jax.random.key(0)) # 临时创建一个真实模型
+    actual_init_params = nnx.state(model_for_init).to_pure_dict()
+
+    partial_params = _load_weights_and_validate(
+        config.weight_loader, 
+        train_state_shape.params.to_pure_dict(),
+        actual_init_params # 传入真实实值
+    )
+    
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     # Initialize the train state and mix in the partial params.
