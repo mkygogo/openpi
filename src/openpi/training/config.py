@@ -203,67 +203,116 @@ import torch
 import openpi.shared.normalize as normalize
 from openpi import transforms
 from PIL import Image
-def _convert_tensors_to_numpy(data):
-    # 1. 处理图像维度、类型与归一化恢复
+import flax.traverse_util
+def _process_single_image(v):
+    """辅助函数：统一处理图像转 numpy + 维度调整"""
+    img = v.numpy() if isinstance(v, torch.Tensor) else np.array(v)
+    if img.ndim == 3 and img.shape[0] == 3:
+        img = img.transpose(1, 2, 0)
+    if img.dtype != np.uint8:
+        img = (img * 255).clip(0, 255).astype(np.uint8)
+    return img
+
+def _robust_convert_and_rename(data):
+    """步骤1：数据预处理、搜索与 Mask 扁平化生成"""
+    flat_data = flax.traverse_util.flatten_dict(data, sep=".")
+    
+    # 初始化：先清空或设置默认值
+    processed_images = {}
+    # 我们直接把 mask 作为独立的 key 放进去，防止被 Flatten 吞掉
+    mask_updates = {}
+    
+    # 模糊搜索图片
+    for key, value in flat_data.items():
+        key_lower = key.lower()
+        if "image" in key_lower and "top" in key_lower:
+            processed_images["base_0_rgb"] = _process_single_image(value)
+            mask_updates["mask_base_0_rgb"] = True # 生成独立 Key
+            
+        elif "image" in key_lower and "wrist" in key_lower:
+            img = _process_single_image(value)
+            processed_images["left_wrist_0_rgb"] = img
+            processed_images["right_wrist_0_rgb"] = img
+            # 生成独立 Key
+            mask_updates["mask_left_wrist_0_rgb"] = True
+            mask_updates["mask_right_wrist_0_rgb"] = True
+
+    if not processed_images:
+        print(f"Warning: No images found in keys: {list(flat_data.keys())}")
+    
+    data.update(processed_images)
+    data.update(mask_updates) # 更新独立的 mask keys
+    
+    # 搜索其他关键数据 (保持不变)
+    for key, value in flat_data.items():
+        if key.endswith("state"): data["state_flat"] = value
+        if key.endswith("action") or key.endswith("actions"): data["action_flat"] = value
+        if key.endswith("task") or key.endswith("instruction"): data["task_flat"] = value
+
+    return data
+
+def _restore_observation_structure(data):
+    """步骤3：将处理后的数据还原为模型需要的 observation 结构"""
+    # 确保 observation 结构存在
+    if "observation" not in data:
+        data["observation"] = {}
+    
+    # 1. 搬运图片
     if "image" in data:
-        new_images = {}
-        image_masks = {} # 准备存放掩码
-        for k, v in data["image"].items():
-            # 转换为 numpy
-            img = v.numpy() if isinstance(v, torch.Tensor) else np.array(v)
-            
-            # 处理 (C, H, W) -> (H, W, C)
-            if img.ndim == 3 and img.shape[0] == 3:
-                img = img.transpose(1, 2, 0)
-            
-            # 确保是 uint8 格式供 PIL/Resize 使用
-            if img.dtype != np.uint8:
-                img = (img * 255).clip(0, 255).astype(np.uint8)
-                
-            new_images[k] = img
-            # 【核心添加】为每个图像通道生成 True 掩码
-            image_masks[k] = True
-            
-        data["image"] = new_images
-        # 【核心修复】注入模型必需的 image_mask 字段
-        data["image_mask"] = image_masks
+        data["observation"]["images"] = data["image"]
+    
+    # 2. 搬运状态
+    if "state" in data:
+        data["observation"]["state"] = data["state"]
         
     return data
 
 @dataclasses.dataclass(frozen=True)
 class MKRobotDataConfig(DataConfigFactory):
-    #data_path: str = "/home/jr/PI/data/mkrobot_cube_dataset"
-    repo_id: str = "mkrobot_cube_dataset"
+    repo_id: str = "/root/autodl-tmp/data/mkrobot_cube_dataset"
+    
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        base_model_transforms = ModelTransformFactory()(model_config)
+        
+        custom_model_transforms = _transforms.Group(
+            inputs = base_model_transforms.inputs + [_restore_observation_structure],
+            outputs = base_model_transforms.outputs
+        )
+
         return DataConfig(
-            repo_id=self.repo_id,#"mkygogo/mkrobot_pi05_cube",
-            asset_id = self.repo_id,
-            #norm_stats=pathlib.Path("assets/pi05_mkrobot_lora/mkrobot_cube_dataset/norm_stats.json"),
+            repo_id=self.repo_id,
+            asset_id=self.repo_id,
             norm_stats=normalize.load(pathlib.Path("assets/pi05_mkrobot_lora/mkrobot_cube_dataset")),
-            # 开启此项，自动从数据集读取你采集时定义的任务指令
             prompt_from_task=True, 
+            
             repack_transforms=_transforms.Group(
                 inputs=[
+                    _robust_convert_and_rename,
                     _transforms.RepackTransform(
                         {
                             "image": {
-                                "top": "observation.images.top",
-                                "wrist": "observation.images.wrist",
+                                "base_0_rgb": "base_0_rgb",
+                                "left_wrist_0_rgb": "left_wrist_0_rgb",
+                                "right_wrist_0_rgb": "right_wrist_0_rgb",
                             },
-                            "state": "observation.state",
-                            "actions": "action",
-                            "prompt": "task",
+                            # 【关键修改】显式地映射每一个 Mask，而不是传递一个字典
+                            "image_mask": {
+                                "base_0_rgb": "mask_base_0_rgb",
+                                "left_wrist_0_rgb": "mask_left_wrist_0_rgb",
+                                "right_wrist_0_rgb": "mask_right_wrist_0_rgb",
+                            },
+                            
+                            "state": "state_flat",
+                            "actions": "action_flat",
+                            "prompt": "task_flat",
                         }
                     ),
-                    _convert_tensors_to_numpy,
                 ]
             ),
-            # 使用标准的模型转换，将 448x448 的图像缩放至模型要求的 224x224
-            model_transforms=ModelTransformFactory()(model_config),
+            model_transforms=custom_model_transforms,
             action_sequence_keys=("action",),
         )
-
 
 @dataclasses.dataclass(frozen=True)
 class FakeDataConfig(DataConfigFactory):
