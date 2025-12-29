@@ -270,7 +270,7 @@ def _restore_observation_structure(data):
 @dataclasses.dataclass(frozen=True)
 class MKRobotDataConfig(DataConfigFactory):
     #repo_id: str = "/root/autodl-tmp/data/mkrobot_cube_dataset" #这个是autodl里面的路径
-    repo_id: str = "/home/jr/PI/openpi/assets/pi05_mkrobot_lora/mkrobot_cube_dataset"
+    repo_id: str = "/home/jr/PI/data/mkrobot_cube_dataset"
     
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:

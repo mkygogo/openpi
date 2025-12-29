@@ -18,9 +18,10 @@ except ImportError:
 
 logger = logging.getLogger("MKDriver")
 
-# Sim <-> Real 方向修正
+# Sim (URDF) <-> Real (Motor) 方向映射
 HARDWARE_DIR = np.array([-1.0, 1.0, -1.0, -1.0, -1.0, -1.0])
-# 关节物理限位
+
+# 关节物理限位 (仅作为最后一道防线，逻辑上由模型保证)
 JOINT_LIMITS = {
     0: (-3.0, 3.0), 1: (0.0, 3.0), 2: (0.0, 3.0),
     3: (-1.7, 1.2), 4: (-0.4, 0.4), 5: (-2.0, 2.0),
@@ -36,12 +37,12 @@ class MKRobotStandalone:
         self.is_connected = False
         
         # 参数
-        self.max_step_rad = 0.5 
+        self.max_step_rad = 0.8
         self.gripper_open_pos = 0.0
         self.gripper_closed_pos = -4.7
         
-        # 【关键】记录初始位置，用于相对零点计算
-        self.start_joints = np.zeros(6) 
+        # 【核心逻辑回归】记录上电时的初始位置
+        self.start_joints = np.zeros(6)
 
         # 初始化电机
         if DRIVERS_AVAILABLE:
@@ -70,6 +71,8 @@ class MKRobotStandalone:
                 logger.info("Arm Connected.")
             except Exception as e:
                 logger.error(f"Failed to connect arm: {e}")
+                # 连接失败应抛出异常，不要继续
+                raise e
         
         # 连接相机
         for name, idx in self.camera_indices.items():
@@ -82,24 +85,29 @@ class MKRobotStandalone:
                 pass
 
     def _init_motors(self):
+        """初始化并设定零点"""
         for name, motor in self.motors.items():
             self.control.addMotor(motor)
-            time.sleep(0.02)
+            time.sleep(0.01)
+            
+            # 切换模式并使能
             self.control.switchControlMode(motor, Control_Type.POS_VEL)
             self.control.enable(motor)
             
-            # 设置较硬的 PID 以减少抖动
-            kp = 100 if "gripper" in name else 200
-            self.control.change_motor_param(motor, DM_variable.KP_APR, kp)
-            self.control.change_motor_param(motor, DM_variable.KI_APR, 10) # 增加一点积分项消除静差
+            # 【重要】不强制修改PID，使用电机内部默认参数（您之前的经验证明它是好用的）
+            # self.control.change_motor_param(...) 
+            
+            logger.info(f"{name} enabled.")
 
-        # 【关键逻辑】记录上电时的物理角度作为“零点”
-        raw_current = self._read_physical_joints_raw()
-        self.start_joints = raw_current
-        logger.info(f"Set Start Position as Zero: {self.start_joints}")
+        # 【核心逻辑回归】读取当前物理位置作为零点
+        # 确保这和您采集数据时的行为一致
+        time.sleep(0.1) # 等一下数据稳定
+        self.start_joints = self._read_physical_joints_raw()
+        logger.info(f"📍 Set Zero Point at: {self.start_joints}")
+        logger.info("机械臂已就绪。现在的姿态被定义为 [0, 0, 0, 0, 0, 0]。")
 
     def _read_physical_joints_raw(self) -> np.ndarray:
-        """读取绝对物理角度"""
+        """读取绝对物理角度 (底层原始值)"""
         pos = []
         for i in range(1, 7):
             m = self.motors[f"joint_{i}"]
@@ -116,20 +124,23 @@ class MKRobotStandalone:
                 # 1. 读取绝对物理角度
                 q_real_abs = self._read_physical_joints_raw()
                 
-                # 2. 减去初始位置 (变为相对角度)
+                # 2. 【核心逻辑回归】减去初始位置，得到相对位置
                 q_real_rel = q_real_abs - self.start_joints
                 
                 # 3. 乘以方向系数 -> 得到模型需要的 Sim 角度
                 q_sim = q_real_rel * HARDWARE_DIR
                 
-                # 4. 夹爪处理 (保持原逻辑)
+                # 4. 夹爪处理 (夹爪通常是绝对值，或者根据您的习惯也需要相对值？
+                # 这里保持绝对值映射，因为夹爪行程是固定的)
                 m_grip = self.motors["gripper"]
                 self.control.refresh_motor_status(m_grip)
                 g_pos = m_grip.getPosition()
                 g_norm = (g_pos - self.gripper_open_pos) / (self.gripper_closed_pos - self.gripper_open_pos)
                 
                 state = np.concatenate([q_sim, [g_norm]]).astype(np.float32)
-            except Exception:
+            except Exception as e:
+                # 偶尔读取失败不要崩溃，打印警告即可
+                # logger.warning(f"Read sensor failed: {e}")
                 pass
             
         obs["state"] = state
@@ -158,18 +169,31 @@ class MKRobotStandalone:
         # 2. 转换方向 (Sim -> Real Relative)
         q_real_rel_target = q_sim_target * HARDWARE_DIR
         
-        # 3. 加上初始偏移 (Relative -> Absolute)
-        # 【关键】这就回到了上电时的绝对位置体系
+        # 3. 【核心逻辑回归】加上初始偏移，还原为物理绝对位置
+        # 如果模型输出 0，则目标就是 start_joints
         q_real_abs_target = q_real_rel_target + self.start_joints
         
-        # 4. 这里的平滑与发送逻辑保持不变
-        # ... (省略重复的限位与 control_Pos_Vel 代码，与之前一致)
-        # 简写发送逻辑:
-        DM4340_SPEED = 5.0 
+        # 4. 限制与平滑
+        q_current_real = self._read_physical_joints_raw()
+        q_safe_cmd = []
+        
+        for i in range(6):
+            # 这里的限位其实比较难做，因为不知道 start_joints 是多少
+            # 暂时放宽绝对限位，依赖相对运动幅度限制
+            
+            delta = q_real_abs_target[i] - q_current_real[i]
+            # 限制单步最大速度 (Rad)
+            delta = np.clip(delta, -self.max_step_rad, self.max_step_rad)
+            q_safe_cmd.append(q_current_real[i] + delta)
+
+        DM4340_SPEED = 10.0
+        
+        # 发送关节指令
         for i in range(6):
             motor = self.motors[f"joint_{i+1}"]
-            self.control.control_Pos_Vel(motor, q_real_abs_target[i], DM4340_SPEED)
+            self.control.control_Pos_Vel(motor, q_safe_cmd[i], DM4340_SPEED)
             
+        # 发送夹爪指令
         m_grip = self.motors["gripper"]
         g_real = (g_target * (self.gripper_closed_pos - self.gripper_open_pos)) + self.gripper_open_pos
         self.control.control_Pos_Vel(m_grip, g_real, 10.0)
