@@ -105,6 +105,7 @@ class MKRobotOpenPIEnv(environment.Environment):
         }
 
     def apply_action(self, action: Dict) -> None:
+        
         raw_action = action.get("actions")
         if raw_action is not None:
             if hasattr(raw_action, 'cpu'): raw_action = raw_action.cpu().numpy()
