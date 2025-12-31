@@ -5,6 +5,8 @@ import serial
 import time
 import logging
 from typing import Dict, Any
+import cv2
+import threading
 
 try:
     from .drivers.DM_Control_Python.DM_CAN import Motor, MotorControl, DM_Motor_Type, Control_Type, DM_variable
@@ -29,7 +31,15 @@ def map_range(x: float, in_min: float, in_max: float, out_min: float, out_max: f
 class MKRobotStandalone:
     def __init__(self, port: str = "/dev/ttyACM0", joint_velocity_scaling: float = 0.2,camera_indices: Dict[str, int] = None):
         self.port = port
-        self.camera_indices = camera_indices or {}
+        self.serial_lock = threading.Lock()
+        if camera_indices is None:
+            # 这里填你之前测试成功的参数
+            self.camera_indices = {
+                'top':   {'index': 0, 'width': 640, 'height': 480},
+                'wrist': {'index': 2, 'width': 640, 'height': 360}
+            }
+        else:
+            self.camera_indices = camera_indices
         self.cameras = {}
         self.serial_conn = None
         self.control = None
@@ -49,6 +59,10 @@ class MKRobotStandalone:
         
         self.DM4310_SPEED = 200/60*2*np.pi   # rad/s (200  rpm | 20.94 rad/s)
         self.DM4340_SPEED = 52.5/60*2*np.pi  # rad/s (52.5 rpm | 5.49  rad/s)
+        # 对应: [J1, J2, J3, J4, J5, J6, Gripper]
+        # 根据你的测试：除了 J2(索引1) 和 夹爪(索引6)，其他全反
+        # ------------------------------------------------------------
+        self.HARDWARE_DIR = np.array([-1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0], dtype=np.float32)
 
         # 初始化电机
         if DRIVERS_AVAILABLE:
@@ -142,37 +156,68 @@ class MKRobotStandalone:
         self.is_connected = True
         self.configure()
 
-        for name, idx in self.camera_indices.items():
+        for name, config in self.camera_indices.items():
             try:
+                # 1. 解析参数：兼容旧的 int 格式和新的 dict 格式
+                if isinstance(config, int):
+                    idx = config
+                    w, h = 640, 480 # 旧代码的默认值
+                elif isinstance(config, dict):
+                    idx = config.get('index', 0)
+                    w = config.get('width', 640)
+                    h = config.get('height', 480)
+                else:
+                    continue
+
+                # 2. 设置摄像头
                 cap = cv2.VideoCapture(idx)
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                self.cameras[name] = cap
-            except Exception:
-                pass
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+                
+                # 3. 存储对象
+                if cap.isOpened():
+                    self.cameras[name] = cap
+                    print(f"📷 Camera '{name}' connected: Index={idx}, Res={w}x{h}")
+                else:
+                    print(f"⚠️ Warning: Camera '{name}' (Index {idx}) failed to open.")
+                    
+            except Exception as e:
+                print(f"❌ Error initializing camera {name}: {e}")
 
     def get_observation(self) -> Dict[str, Any]:
         """
         对外接口: 适配 env.py
         返回: {'state': np.ndarray, 'images': dict}
         """
-        # 调用内部实现获取原始数据
-        raw_obs = self._get_observation()
+        print("✅✅✅ YES! NEW CODE IS RUNNING! ✅✅✅")
+        with self.serial_lock:
+            raw_obs = self._get_observation()
+
         if raw_obs is None:
             return {"state": np.zeros(7, dtype=np.float32), "images": {}}
 
         # 1. 解析 State 字典转 Array
         # 你的 _get_observation 返回的是 {'joint_1.pos': val, ...}
         # 我们需要按 j1...j6, gripper 的顺序拼成 (7,) 数组
-        q_list = []
-        for i in range(1, 7):
-            key = f"joint_{i}.pos"
-            q_list.append(raw_obs.get(key, 0.0))
+        # q_list = []
+        # for i in range(1, 7):
+        #     key = f"joint_{i}.pos"
+        #     q_list.append(raw_obs.get(key, 0.0))
+        # # 夹爪
+        # q_list.append(raw_obs.get("gripper.pos", 0.0))
+        q_list = [
+            raw_obs.get("joint_1.pos", 0.0),
+            raw_obs.get("joint_2.pos", 0.0),
+            raw_obs.get("joint_3.pos", 0.0),
+            raw_obs.get("joint_4.pos", 0.0),
+            raw_obs.get("joint_5.pos", 0.0),
+            raw_obs.get("joint_6.pos", 0.0),
+            raw_obs.get("gripper.pos", 0.0)
+        ]
         
-        # 夹爪
-        q_list.append(raw_obs.get("gripper.pos", 0.0))
-        
-        state_array = np.array(q_list, dtype=np.float32)
+        physical_state = np.array(q_list, dtype=np.float32)
+        sim_state = physical_state * self.HARDWARE_DIR
+        #state_array = np.array(q_list, dtype=np.float32)
 
         # 2. 图像直接透传 (假设 _get_observation 里的 images 逻辑已经处理了)
         # 注意：看你原来的代码，_get_observation 里 images 变量虽然生成了但没塞进 return 的字典里
@@ -190,7 +235,7 @@ class MKRobotStandalone:
             else:
                 images[name] = np.zeros((480, 640, 3), dtype=np.uint8)
 
-        return {"state": state_array, "images": images}
+        return {"state": sim_state, "images": images}
 
     def _get_observation(self) -> dict[str, Any]:
         if not self.is_connected:
@@ -215,20 +260,19 @@ class MKRobotStandalone:
         return obs_dict
 
     def check_joints_limit(self, action_array: np.ndarray) -> np.ndarray:
-        """
-        检查并限制关节角度在物理范围内
-        action_array: (7,) float array
-        """
+        if action_array is None:
+            return np.zeros(7, dtype=np.float32)
+            
         safe_action = action_array.copy()
-        # 遍历前6个关节
+        
         for i in range(6):
             if i in JOINT_LIMITS:
                 min_lim, max_lim = JOINT_LIMITS[i]
                 safe_action[i] = np.clip(safe_action[i], min_lim, max_lim)
-        # 夹爪限制在 0.0 ~ 1.0
-        safe_action[6] = np.clip(safe_action[6], 0.0, 1.0)
         
-        return safe_action        
+        # 夹爪限位
+        safe_action[6] = np.clip(safe_action[6], 0.0, 1.0)
+        return safe_action  
 
     def send_action(self, action: np.ndarray):
         """
@@ -240,10 +284,15 @@ class MKRobotStandalone:
         # 0. 确保是 numpy 数组
         if not isinstance(action, np.ndarray):
             action = np.array(action, dtype=np.float32)
+        # 不管传来的是 (30, 7) 还是 (1, 7)，直接拍扁取前7个
+        if action.size >= 7:
+            action = action.flatten()[:7]
+
+        target_physical = action * self.HARDWARE_DIR
 
         # 1. 安全防护：限位检查
         # 你的 _send_action 里是直接执行，所以在传给它之前必须截断
-        safe_action_arr = self.check_joints_limit(action)
+        safe_action_arr = self.check_joints_limit(target_physical)
 
         # 2. 构造 _send_action 需要的字典格式
         # 格式: {'joint_1.pos': val, ..., 'gripper.pos': val}
@@ -253,8 +302,8 @@ class MKRobotStandalone:
         
         action_dict["gripper.pos"] = safe_action_arr[6]
 
-        # 3. 调用内部实现发送
-        self._send_action(action_dict)
+        with self.serial_lock:
+            self._send_action(action_dict)
 
     def _send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         if not self.is_connected:
@@ -284,11 +333,19 @@ class MKRobotStandalone:
            print(f"{self} is not connected.")
            return
 
-        if self.config.disable_torque_on_disconnect:
+        # 默认策略：断开连接前，先让电机失能(卸力)，防止意外
+        try:
             for motor in self.motors.values():
                 self.control.disable(motor)
-        else:
-            self.control.serial_.close()
+        except Exception as e:
+            logger.error(f"Error disabling motors during disconnect: {e}")
+
+        # 关闭串口
+        try:
+            if hasattr(self.control, 'serial_'):
+                self.control.serial_.close()
+        except Exception as e:
+            logger.error(f"Error closing serial port: {e}")
         self.is_connected = False
 
         for cap in self.cameras.values(): 

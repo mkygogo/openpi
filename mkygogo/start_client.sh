@@ -20,6 +20,7 @@ fi
 HOST="localhost"   # 如果服务端在另一台机器，请改为服务器 IP
 PORT=8000
 PROMPT="pick up the small cube and place it in the box" # 提示词
+ACTION_HORIZON=25
 HZ=30 # 控制频率
 
 echo "Starting MKRobot Client..."
@@ -33,4 +34,4 @@ uv run python mkygogo/mkrobot/main.py \
     --port "$PORT" \
     --prompt "$PROMPT" \
     --control_hz "$HZ" \
-    --action_horizon 6
+    --action_horizon "$ACTION_HORIZON"

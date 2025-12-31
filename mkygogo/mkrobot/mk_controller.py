@@ -13,7 +13,7 @@ logger = logging.getLogger("MKController")
 
 class MKController:
     def __init__(self, port="/dev/ttyACM0", camera_indices=None):
-        self.driver = MKRobotStandalone(port, camera_indices)
+        self.driver = MKRobotStandalone(port=port, camera_indices=camera_indices)
         self.is_paused = False
         
     def connect(self):

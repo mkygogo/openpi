@@ -137,6 +137,25 @@ class Normalize(DataTransformFn):
     def _normalize(self, x, stats: NormStats):
         mean, std = stats.mean[..., : x.shape[-1]], stats.std[..., : x.shape[-1]]
         return (x - mean) / (std + 1e-6)
+    # def _normalize(self, x, stats: NormStats):  
+    #     # === 🔍 调试日志: 看看这次进来的到底是谁 ===
+    #     print(f"DEBUG: _normalize input x={x.shape}, model mean={stats.mean.shape}")
+
+    #     # 1. 获取模型期望的维度 (例如 7)
+    #     model_dim = stats.mean.shape[-1]
+        
+    #     # 2. [核心修复] 如果输入 x (14) 比模型 (7) 长，强制裁切 x
+    #     if x.shape[-1] > model_dim:
+    #         # print(f"DEBUG: Cropping input {x.shape} -> ({model_dim},)")
+    #         x = x[..., :model_dim]
+            
+    #     # 3.原有逻辑 (处理 x 比模型短的情况)
+    #     # 此时 x 已经是 7 了，stats.mean[:7] 也是 7
+    #     mean = stats.mean[..., : x.shape[-1]]
+    #     std = stats.std[..., : x.shape[-1]]
+        
+    #     # 4. 计算 (7 - 7)，完美通过
+    #     return (x - mean) / (std + 1e-6)
 
     def _normalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
@@ -171,6 +190,28 @@ class Unnormalize(DataTransformFn):
         mean = pad_to_dim(stats.mean, x.shape[-1], axis=-1, value=0.0)
         std = pad_to_dim(stats.std, x.shape[-1], axis=-1, value=1.0)
         return x * (std + 1e-6) + mean
+    # def _unnormalize(self, x, stats: NormStats):
+    #     # === 🩹 [Server 输出补丁] 强制 7 转 14 ===
+        
+    #     # 1. 正常反归一化 (先还原回真实的 7 维物理数据)
+    #     mean, std = stats.mean, stats.std
+    #     x = x * (std + 1e-6) + mean
+        
+    #     # 2. 检查输出维度
+    #     current_dim = x.shape[-1]
+        
+    #     # 3. [硬逻辑] 如果只有 7 维，Client 会崩，必须补到 14 维！
+    #     if current_dim == 7:
+    #         print(f"DEBUG: Force Padding Output 7 -> 14")
+            
+    #         # 计算需要补 7 个 0
+    #         pad_width = 7
+    #         # 构造全 0 的 padding
+    #         padding = np.zeros((*x.shape[:-1], pad_width), dtype=x.dtype)
+    #         # 拼接到 x 后面
+    #         x = np.concatenate([x, padding], axis=-1)
+            
+    #     return x
 
     def _unnormalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None

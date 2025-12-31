@@ -1,8 +1,10 @@
 import numpy as np
 import logging
 import cv2
-from typing import Dict
+from typing import Dict, Any
 from openpi_client.runtime import environment
+import time
+from gymnasium import spaces
 
 # 改用 Controller
 from mkygogo.mkrobot.mk_controller import MKController
@@ -19,10 +21,26 @@ class MKRobotOpenPIEnv(environment.Environment):
         self.controller.connect()
         self.step_count = 0
 
+    @property
+    def action_space(self):
+        # 7个维度：6个关节 + 1个夹爪
+        # 范围可以写大一点，主要是维度 (7,) 要对
+        return spaces.Box(low=-3.14, high=3.14, shape=(7,), dtype=np.float32)
+
+    @property
+    def observation_space(self):
+        # 同样定义观测空间为 7 维
+        return spaces.Dict({
+            "state": spaces.Box(low=-3.14, high=3.14, shape=(7,), dtype=np.float32),
+            "images": spaces.Dict({
+                "top": spaces.Box(low=0, high=255, shape=(480, 640, 3), dtype=np.uint8),
+                "wrist": spaces.Box(low=0, high=255, shape=(480, 640, 3), dtype=np.uint8),
+            })
+        })
+
     def _process_image(self, img_np, target_size=448):
         """
         复刻训练时的图像处理逻辑：中心裁剪 + 缩放
-        保持输入输出均为 Numpy [H, W, C] (OpenCV格式)，避免 Client 端引入 Torch 复杂性
         """
         if img_np is None:
             return np.zeros((target_size, target_size, 3), dtype=np.uint8)
@@ -42,7 +60,7 @@ class MKRobotOpenPIEnv(environment.Environment):
 
     def reset(self) -> None:
         logger.info("Resetting environment...")
-        pass
+        return self.get_observation()
 
     def is_episode_complete(self) -> bool:
         return False
@@ -50,44 +68,40 @@ class MKRobotOpenPIEnv(environment.Environment):
     def get_observation(self) -> Dict:
         raw_obs = self.controller.get_observation()
         
-        raw_img_base = raw_obs["images"].get("top")
-        raw_img_wrist = raw_obs["images"].get("wrist")
-        state = raw_obs["state"]
+        # 安全获取
+        images = raw_obs.get("images", {})
+        raw_img_base = images.get("top")
+        raw_img_wrist = images.get("wrist")
+        
+        state = raw_obs.get("state")
+        
+        if state is None: 
+            state = np.zeros(7, dtype=np.float32)
+        
+        # 可选：加个安全截断，防止万一 driver 抽风发多了
+        if state.shape[0] > 7:
+            state = state[:7]
 
+        # 图像容错
         if raw_img_base is None: raw_img_base = np.zeros((480, 640, 3), dtype=np.uint8)
         if raw_img_wrist is None: raw_img_wrist = np.zeros((360, 640, 3), dtype=np.uint8)
 
-        # 这里处理后，图像尺寸变为 448x448，且内容经过了中心裁剪
         img_base_processed = self._process_image(raw_img_base, target_size=448)
         img_wrist_processed = self._process_image(raw_img_wrist, target_size=448)
-
-        # ==========================================================
-        # 🛠️ DEBUG: 渲染送给模型的图像 (这就真的是模型看到的画面)
-        # ==========================================================
+        
+        # DEBUG View 
         try:
-            # OpenCV 的 imshow 默认需要 BGR 格式，但我们的 img_base 是 RGB
-            # 如果直接 show，红色物体会变蓝。为了方便人眼观察，我们转回 BGR 显示。
-            # (这不影响送给模型的数据，只影响显示的窗口)
+            self.step_count += 1
             show_base = cv2.cvtColor(img_base_processed, cv2.COLOR_RGB2BGR)
             show_wrist = cv2.cvtColor(img_wrist_processed, cv2.COLOR_RGB2BGR)
-
-            # 在图片上打印当前的 Step，方便截图分析
-            cv2.putText(show_base, f"TOP Step: {self.step_count}", (10, 30), 
+            cv2.putText(show_base, f"Step: {self.step_count}", (10, 30), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            # 显示窗口
-            cv2.imshow("Debug View: TOP (Processed)", show_base)
-            cv2.imshow("Debug View: WRIST (Processed)", show_wrist)
-            
-            # 必须调用 waitKey 才能刷新窗口，1ms 延迟
+            cv2.imshow("Debug View: TOP", show_base)
+            cv2.imshow("Debug View: WRIST", show_wrist)
             cv2.waitKey(1)
-        except Exception as e:
-            print(f"Display Error: {e}")
-        # ==========================================================
+        except Exception: pass
 
-
-        # 保存状态供 debug 使用
-        self.current_state = state
+        self.current_state = {"state": state}
 
         return {
             "image": {
@@ -104,34 +118,51 @@ class MKRobotOpenPIEnv(environment.Environment):
             "prompt": self.prompt 
         }
 
-    def apply_action(self, action: Dict) -> None:
-        
+    def apply_action(self, action: Dict[str, Any]) -> None:
+        """
+        [修正版] 分块流式执行 + 对接 Controller 安全层
+        """
         raw_action = action.get("actions")
-        if raw_action is not None:
-            if hasattr(raw_action, 'cpu'): raw_action = raw_action.cpu().numpy()
-            if hasattr(raw_action, 'numpy'): raw_action = raw_action.numpy()
-            
-            # --- 🛡️ 调试日志: 状态 vs 动作 ---
-            # 每 10 步打印一次，避免刷屏太快
-            self.step_count += 1
-            if self.step_count % 10 == 0:
-                # 打印前 3 个关节的角度对比
-                curr = self.current_state
-                act = raw_action
-                diff = act - curr
-                with np.printoptions(precision=3, suppress=True, linewidth=200):
-                    # 重点关注 Act 的最后一位：如果是 1.0 (或接近最大值) 代表闭合，0.0 代表张开
-                    logger.info(f"Step {self.step_count}")
-                    logger.info(f"  Act  (Model): {act}")  
-                    logger.info(f"  Curr (Robot): {curr}")
-                
-                # 如果差值非常大 (例如 > 0.5 弧度)，说明模型输出的和当前位置完全不匹配
-                if np.max(np.abs(diff)) > 0.5:
-                    logger.warning("🚨 动作偏差过大！可能是坐标系不匹配或模型未收敛。")
+        if raw_action is None: return
 
-            # 发送给 Controller 执行
-            self.controller.apply_action(np.array(raw_action))
+        # 1. 转换为 Numpy
+        if not isinstance(raw_action, np.ndarray):
+            raw_action = np.array(raw_action, dtype=np.float32)
+
+        # 2. 维度标准化 (处理 (7,) 或 (1, N, 7))
+        if raw_action.ndim == 1:
+            raw_action = raw_action.reshape(1, -1)
+        if raw_action.ndim == 3:
+            raw_action = raw_action[0]
+        # 此时 raw_action 是 (N, 7)，比如 (25, 7)
+        # 3. 循环执行 Chunk
+        chunk_len = raw_action.shape[0]
+        if chunk_len > 1:
+            print(f"\n📦 [Env] Start Chunk: {chunk_len} frames")
+
+        control_hz = 30.0
+        dt = 1.0 / control_hz
+        
+        for i in range(chunk_len):
+            loop_start = time.time()
+            
+            # 取出单帧 (7,)
+            single_step = raw_action[i]
+            
+            if chunk_len > 1:
+                if i == 0 or i == chunk_len - 1 or i % 10 == 0:
+                    # 只打印第一个关节的值用于观察
+                    print(f"   -> Step {i+1:02d}/{chunk_len} | J1: {single_step[0]:.4f} ...")
+
+            self.controller.apply_action(single_step)   
+            # 控频
+            elapsed = time.time() - loop_start
+            sleep_time = dt - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
     def close(self):
         cv2.destroyAllWindows()
-        self.controller.close()
+        # 确保 controller 有 close 方法，如果没有会报错
+        if hasattr(self.controller, "close"):
+            self.controller.close()

@@ -9,7 +9,8 @@ cd "$PROJECT_ROOT"
 
 # 配置参数
 # 1. Checkpoint 路径
-CHECKPOINT_DIR="/home/jr/PI/checkpoints/mkrobot_pi05_lora_pickandplace_29999"
+#CHECKPOINT_DIR="/home/jr/PI/checkpoints/mkrobot_pi05_lora_pickandplace_29999"
+CHECKPOINT_DIR="/home/jr/PI/checkpoints/mkrobot_pi05_lora_pickandplace_100_29999"
 # 2. 训练配置名称
 CONFIG_NAME="pi05_mkrobot_lora"
 # 3. 端口
