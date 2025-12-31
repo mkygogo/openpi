@@ -82,7 +82,15 @@ def main():
     for i in range(total_frames):
         row = df.iloc[i]
         ground_truth_actions.append(row['action'])
-        
+
+        state = row['observation.state'] # <--- 这里读出来的就是真值
+        if i == 0:
+            state_arr = np.array(state)
+            print("\n" + "="*40)
+            print(f"🧐 [真相时刻] 数据集里的 State 形状: {state_arr.shape}")
+            print(f"🧐 [真相时刻] 数据内容: {state_arr}")
+            print("="*40 + "\n")
+
         ret_t, frame_top = cap_top.read()
         ret_w, frame_wrist = cap_wrist.read()
         if not ret_t or not ret_w: break
