@@ -66,7 +66,8 @@ class NormalizedMKRobotEnv(MKRobotOpenPIEnv):
         if "actions" in action:
             # 1. 获取原始数据 (可能形状是 (30, 7) 或者 (1, 30, 7))
             raw_action = np.array(action["actions"], dtype=np.float32)
-            
+            raw = np.array(action["actions"])
+            #print(f"\n🐛 [Main] Wrapper received action shape: {raw.shape}")
             # --- 🛡️ [修正] 删除破坏维度的代码 ---
             # ❌ 不要 raw_action.flatten() -> 这会把30帧拍扁成一长条
             # ❌ 不要 raw_action[:7] -> 这会丢掉后29帧，导致卡顿
@@ -75,7 +76,7 @@ class NormalizedMKRobotEnv(MKRobotOpenPIEnv):
             # 这里的目的是让 numpy 广播乘法能正常工作
             if raw_action.ndim == 3: # 处理 (1, 30, 7) 这种情况
                 raw_action = raw_action[0] 
-            
+            #print(f"🐛 [Main] After squeeze: {raw_action.shape}")
             # 此时 raw_action 应该是 (30, 7) 或 (1, 7)
             
             # 3. 反归一化 (保留！幅度就靠它了)
@@ -136,7 +137,7 @@ def main(args: Args):
         logging.info("Stopping...")
         
     except Exception as e:
-        logging.error(f"Runtime error: {e}")
+        logging.error(f"Runtime error?: {e}")
         
     finally:
         # 安全归位逻辑

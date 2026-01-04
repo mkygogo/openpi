@@ -14,8 +14,11 @@ logger = logging.getLogger(__name__)
 class MKRobotOpenPIEnv(environment.Environment):
     def __init__(self, prompt: str, port: str = "/dev/ttyACM0"):
         self.prompt = prompt
-        camera_indices = {"top": 0, "wrist": 2}
-        
+        camera_indices = {
+                'top':   {'index': 0, 'width': 640, 'height': 480},
+                'wrist': {'index': 2, 'width': 640, 'height': 360}
+                }
+
         # 使用 Controller 封装
         self.controller = MKController(port=port, camera_indices=camera_indices)
         self.controller.connect()
@@ -63,9 +66,20 @@ class MKRobotOpenPIEnv(environment.Environment):
         return self.get_observation()
 
     def is_episode_complete(self) -> bool:
+        #logger.info("is_episode_complete")
         return False
 
     def get_observation(self) -> Dict:
+
+        # === ⏱️ [DEBUG] 测速 ===
+        import time
+        now = time.time()
+        if hasattr(self, '_last_loop_time'):
+            dt = now - self._last_loop_time
+            fps = 1.0 / dt if dt > 0 else 0
+            #print(f"⚡ [Env] 实际循环频率: {fps:.1f} Hz (耗时: {dt*1000:.1f} ms)")
+        self._last_loop_time = now
+        # =======================
         raw_obs = self.controller.get_observation()
         
         # 安全获取
@@ -81,7 +95,7 @@ class MKRobotOpenPIEnv(environment.Environment):
         # 可选：加个安全截断，防止万一 driver 抽风发多了
         if state.shape[0] > 7:
             state = state[:7]
-
+        
         # 图像容错
         if raw_img_base is None: raw_img_base = np.zeros((480, 640, 3), dtype=np.uint8)
         if raw_img_wrist is None: raw_img_wrist = np.zeros((360, 640, 3), dtype=np.uint8)
@@ -102,7 +116,7 @@ class MKRobotOpenPIEnv(environment.Environment):
         except Exception: pass
 
         self.current_state = {"state": state}
-
+        
         return {
             "image": {
                 "base_0_rgb": img_base_processed,
@@ -122,12 +136,15 @@ class MKRobotOpenPIEnv(environment.Environment):
         """
         [修正版] 分块流式执行 + 对接 Controller 安全层
         """
+        #print(f"🐛 [Main] After squeeze: {raw_action.shape}")
         raw_action = action.get("actions")
         if raw_action is None: return
 
         # 1. 转换为 Numpy
         if not isinstance(raw_action, np.ndarray):
             raw_action = np.array(raw_action, dtype=np.float32)
+
+        #print(f"🐛 [Env] Raw action shape: {raw_action.shape}, ndim={raw_action.ndim}")
 
         # 2. 维度标准化 (处理 (7,) 或 (1, N, 7))
         if raw_action.ndim == 1:
@@ -137,22 +154,21 @@ class MKRobotOpenPIEnv(environment.Environment):
         # 此时 raw_action 是 (N, 7)，比如 (25, 7)
         # 3. 循环执行 Chunk
         chunk_len = raw_action.shape[0]
-        if chunk_len > 1:
-            print(f"\n📦 [Env] Start Chunk: {chunk_len} frames")
+        #print(f"🐛 [Env] Chunk execution: len={chunk_len}")
+        #if chunk_len > 7:
+        #    print("🐛 [Env] ⚠️ CAUTION: Chunk length > 7, checking loop logic...")
 
         control_hz = 30.0
         dt = 1.0 / control_hz
         
         for i in range(chunk_len):
             loop_start = time.time()
-            
+            #print(f"🐛 [Env] Loop i={i}/{chunk_len}, accessing raw_action[{i}]")
             # 取出单帧 (7,)
             single_step = raw_action[i]
             
-            if chunk_len > 1:
-                if i == 0 or i == chunk_len - 1 or i % 10 == 0:
-                    # 只打印第一个关节的值用于观察
-                    print(f"   -> Step {i+1:02d}/{chunk_len} | J1: {single_step[0]:.4f} ...")
+            if single_step.shape != (7,):
+                print(f"🐛 [Env] ❌ ERROR: Single step shape wrong! {single_step.shape}")
 
             self.controller.apply_action(single_step)   
             # 控频

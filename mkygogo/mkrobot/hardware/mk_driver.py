@@ -189,7 +189,7 @@ class MKRobotStandalone:
         对外接口: 适配 env.py
         返回: {'state': np.ndarray, 'images': dict}
         """
-        print("✅✅✅ YES! NEW CODE IS RUNNING! ✅✅✅")
+        #print("✅✅✅ YES! NEW CODE IS RUNNING! ✅✅✅")
         with self.serial_lock:
             raw_obs = self._get_observation()
 
@@ -279,14 +279,21 @@ class MKRobotStandalone:
         对外接口: 适配 env.py
         输入: np.ndarray (7,) [j1...j6, gripper]
         """
+        try:
+            shape_info = action.shape if hasattr(action, 'shape') else 'no_shape'
+            #print(f"🐛 [Driver] send_action input: shape={shape_info}, size={action.size}")
+        except Exception as e:
+            print(f"🐛 [Driver] Logging error: {e}")
+
         if not self.is_connected: return
 
         # 0. 确保是 numpy 数组
         if not isinstance(action, np.ndarray):
             action = np.array(action, dtype=np.float32)
         # 不管传来的是 (30, 7) 还是 (1, 7)，直接拍扁取前7个
-        if action.size >= 7:
-            action = action.flatten()[:7]
+        #print(f"send_action !!!!!!: action.size:{action.size}")
+        #if action.size >= 7:
+        #    action = action.flatten()[:7]
 
         target_physical = action * self.HARDWARE_DIR
 
