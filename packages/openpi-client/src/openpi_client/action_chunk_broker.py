@@ -129,6 +129,8 @@ class ActionChunkBroker(_base_policy.BasePolicy):
 
         # 使用 with_path 以便识别 key
         results = tree.map_structure_with_path(slicer, self._last_results)
+        # 只有第 0 帧是新的，需要插值；后续帧都是连续的，不需要插值
+        results["is_new_chunk"] = (self._cur_step == 0)
         self._cur_step += 1
 
         # 3. 决定何时获取下一批数据

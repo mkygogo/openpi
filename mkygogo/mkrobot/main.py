@@ -135,31 +135,28 @@ def main(args: Args):
         
     except KeyboardInterrupt:
         logging.info("Stopping...")
+        #给归位过程加锁，防止二次中断报错
+        try:
+            # 创建一个全 0 的姿态作为归位目标 (根据你的机器人实际情况调整)
+            # 注意：这里假设你的归位就是回到 0 位。如果不是，请保留你原有的逻辑
+            target_state = np.zeros(7, dtype=np.float32)
+            
+            # 强制执行归位，并忽略期间的任何按键中断
+            env.controller.apply_action(target_state)
+            
+        except Exception:
+            # 如果在归位时用户又狂按 Ctrl+C，或者再次触发检测，直接忽略
+            pass
+        print("✅ 已归位。")
+        
         
     except Exception as e:
         logging.error(f"Runtime error?: {e}")
-        
+
     finally:
         # 安全归位逻辑
         if 'env' in locals():
             print("\n🛑 正在安全归位...")
-            # try:
-            #     obs = env.get_observation()
-            #     if obs and "state" in obs:
-            #         current = obs["state"]
-            #         target = np.zeros_like(current)
-            #         target[6] = current[6] 
-                    
-            #         steps = 100
-            #         for i in range(steps):
-            #             alpha = (i + 1) / steps
-            #             interp = current * (1 - alpha) + target * alpha
-            #             env.controller.apply_action(interp)
-            #             time.sleep(0.03)
-            #         print("✅ 已归位。")
-            # except Exception as e:
-            #     print(f"归位失败: {e}")
-            # env.close()
             try:
                 # 简单归位：给一个全 0 的动作（或者你的归位逻辑）
                 # 注意：这里构造一个 (1, 7) 的动作，而不是 (7,)
