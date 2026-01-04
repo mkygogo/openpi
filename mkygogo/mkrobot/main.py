@@ -5,10 +5,11 @@ import dataclasses
 import numpy as np
 from openpi_client import action_chunk_broker
 from openpi_client import websocket_client_policy
-from openpi_client.runtime import runtime
-from openpi_client.runtime.agents import policy_agent
+#from openpi_client.runtime import runtime
+#from openpi_client.runtime.agents import policy_agent
 
 from mkygogo.mkrobot.env import MKRobotOpenPIEnv
+from mkygogo.mkrobot.mk_controller import RobotResetException
 
 # =============================================================================
 # 🔧 配置区域
@@ -28,39 +29,6 @@ class Args:
     
     control_hz: float = 30.0  
 
-# =============================================================================
-# 🛠️ 包装类：负责反归一化 + 维度安全检查 (核心修改)
-# =============================================================================
-# class NormalizedMKRobotEnv(MKRobotOpenPIEnv):
-#     def apply_action(self, action: dict):
-#         if "actions" in action:
-#             # 1. 获取原始数据
-#             raw_action = np.array(action["actions"], dtype=np.float32)
-            
-#             # --- 🛡️ [关键修复] 维度安全卫士 ---
-#             # 问题根源：如果 horizon 很大，raw_action 可能会变成 (1, 7) 甚至 (N, 7)
-#             # 这会导致底层驱动在用 raw_action[i] 访问时，访问的是"第i行"而不是"第i个关节"
-#             # 进而导致 IndexError: index 7 out of bounds
-            
-#             # 强制拍扁成一维数组 (7,)
-#             raw_action = raw_action.flatten()
-            
-#             # 截断/检查：确保只有 7 个数
-#             if raw_action.shape[0] > 7:
-#                 # 如果传来了多个动作，我们只取第一个 (通常 Runtime 会帮我们切好，但为了保险)
-#                 raw_action = raw_action[:7]
-#             elif raw_action.shape[0] < 7:
-#                 print(f"Error: Action shape mismatch! Expected 7, got {raw_action.shape}")
-#                 return
-#             # -----------------------------------
-            
-#             # 2. 反归一化
-#             physical_action = raw_action * JOINT_NORM_SCALE
-            
-#             # 3. 更新回去
-#             action["actions"] = physical_action
-            
-#         super().apply_action(action)
 class NormalizedMKRobotEnv(MKRobotOpenPIEnv):
     def apply_action(self, action: dict):
         if "actions" in action:
@@ -113,25 +81,43 @@ def main(args: Args):
         logging.error(f"Hardware init failed: {e}")
         return
 
-    agent = policy_agent.PolicyAgent(
-        policy=action_chunk_broker.ActionChunkBroker(
-            policy=policy_client,
-            action_horizon=args.action_horizon, 
+    #初始化 Broker
+    if args.action_horizon > 1:
+        policy_client = action_chunk_broker.ActionChunkBroker(
+            policy=policy_client, 
+            action_horizon=args.action_horizon
         )
-    )
 
-    rt = runtime.Runtime(
-        environment=env,
-        agent=agent,
-        subscribers=[],
-        max_hz=args.control_hz,
-        num_episodes=1000 
-    )
-
+    logging.info(f"Starting inference at {args.control_hz}Hz with Horizon={args.action_horizon}...")
+    print(f"\n>>> 提示词: {args.prompt} <<<")
+    print(">>> 机械臂运行中，按 Ctrl+C 停止，按空格键暂停/重置 <<<\n")
     try:
-        logging.info(f"Starting inference at {args.control_hz}Hz with Horizon={args.action_horizon}...")
-        print(">>> 机械臂运行中，按 Ctrl+C 停止 <<<")
-        rt.run()
+        while True:
+            # === 单次任务循环 (处理 Space 重置) ===
+            try:
+                logging.info("Starting episode...")
+                
+                # 1. 重置环境和策略 (清空缓存)
+                obs = env.reset()
+                policy_client.reset() 
+
+                # 2. 推理循环
+                while not env.is_episode_complete():
+                    # 网络推理
+                    action = policy_client.infer(obs)
+                    
+                    # 执行动作 
+                    # (如果用户按了 Space，这里会抛出 RobotResetException)
+                    env.apply_action(action)
+                    
+                    # 获取新观测
+                    obs = env.get_observation()
+
+            # 3. 捕获重置信号
+            except RobotResetException:
+                print("\n⚠️  [System] 收到重置请求，丢弃当前任务，重新开始...\n")
+                # 跳回 while True 开头，触发下一次 reset()
+                continue
         
     except KeyboardInterrupt:
         logging.info("Stopping...")
